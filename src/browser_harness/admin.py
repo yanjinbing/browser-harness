@@ -1637,6 +1637,7 @@ def _launch_debuggable_browser():
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--password-store=basic",
     ]
     if not _chrome_supports_sandbox(binary):
         # Unprivileged container: the zygote cannot clone a user namespace, so
