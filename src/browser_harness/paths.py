@@ -47,3 +47,30 @@ def tmp_dir() -> Path:
 def workspace_dir() -> Path:
     raw = os.environ.get("BH_AGENT_WORKSPACE")
     return ensure_private_dir(Path(raw).expanduser().resolve() if raw else home_dir() / "agent-workspace")
+
+
+def automation_profile_dir() -> Path:
+    """Dedicated user-data dir for the browser we auto-launch.
+
+    Kept separate from the user's real browser profiles: an automation
+    instance must never take over a profile the user is browsing in, and on
+    recent Chrome builds a dedicated profile is the only one that reliably
+    accepts ``--remote-debugging-port``.
+    """
+    raw = (os.environ.get("BH_AUTO_PROFILE_DIR") or "").strip()
+    if raw:
+        return ensure_private_dir(Path(raw).expanduser().resolve())
+    return ensure_private_dir(home_dir() / "automation-profile")
+
+
+def auto_debug_port() -> int:
+    """Remote-debugging port used for browsers we launch ourselves."""
+    raw = (os.environ.get("BH_AUTO_PORT") or "").strip()
+    if raw.isdigit():
+        try:
+            port = int(raw)
+        except ValueError:
+            port = 0
+        if 1 <= port <= 65535:
+            return port
+    return 9333

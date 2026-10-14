@@ -346,6 +346,51 @@ def _chrome_not_running(msg):
     return "chrome-not-running" in (msg or "").lower()
 
 
+def _cdp_endpoint_unreachable(msg):
+    """True when a BU_CDP_URL we injected stopped resolving (browser closed)."""
+    lower = (msg or "").lower()
+    return "bu_cdp_url=" in lower and "unreachable" in lower
+
+
+def _daemon_needs_browser(msg):
+    """True when the daemon failed because no drivable local browser exists.
+
+    Covers both "nothing is running" and "the endpoint we were pointed at went
+    away"; either way the fix is to clean up unusable instances and relaunch.
+    """
+    return _chrome_not_running(msg) or _cdp_endpoint_unreachable(msg)
+
+
+def _uncontrollable_browser_running():
+    """True when a browser is up but cannot be driven over CDP.
+
+    This is the "browser exists but does not meet the requirements" case: it was
+    started without a debug port (or its port stopped answering), so the daemon
+    can only fail. Positively confirmed from /proc rather than inferred from the
+    daemon's message, and POSIX-only -- on macOS/Windows the user-facing
+    chrome://inspect flow stays in charge.
+    """
+    import platform
+
+    if platform.system() in ("Darwin", "Windows"):
+        return False
+    try:
+        from .daemon import remote_debugging_user_enabled
+
+        if remote_debugging_user_enabled() is True:
+            # The user turned on chrome://inspect's toggle. That opens a debug
+            # port with no --remote-debugging-port flag, so the /proc scan below
+            # would misread it as undrivable and kill a working browser.
+            return False
+    except Exception:
+        pass
+    for pid, (exe, cmdline) in _browser_main_pids().items():
+        port = _debug_port_of(cmdline)
+        if port is None or not _devtools_reachable(port):
+            return True
+    return False
+
+
 def _is_local_chrome_mode(env=None):
     """True when the daemon discovers a local Chrome instead of a remote CDP WS."""
     env = env or {}
@@ -559,7 +604,12 @@ def ensure_daemon(wait=None, name=None, env=None):
     launched_browser = None
     opened_inspect = False
     for _ in range(3):
+        auto_url = _auto_debug_url(launched_browser[1] if launched_browser else None)
         e = {**os.environ, **({"BU_NAME": name} if name else {}), **(env or {})}
+        if auto_url:
+            # We launched this browser ourselves and know its endpoint; let the
+            # daemon use it instead of guessing via DevToolsActivePort.
+            e["BU_CDP_URL"] = auto_url
         try:
             stderr_sink = open(ipc.log_path(name or NAME), "ab")
         except OSError:
@@ -646,6 +696,31 @@ def ensure_daemon(wait=None, name=None, env=None):
                     "permission-blocked: the pending Chrome connection ended before approval; "
                     "browser-harness did not retry or create another connection."
                 )
+        if local and (
+            _daemon_needs_browser(msg)
+            or (_needs_chrome_remote_debugging_prompt(msg) and _uncontrollable_browser_running())
+        ):
+            # Nothing drivable is running. Stop the browser instances the
+            # harness cannot attach to (a plain Chrome with no debug port, a
+            # launch that died in the sandbox) and bring up a debuggable one,
+            # then retry: this is the auto-launch / kill-and-relaunch path.
+            # The second clause is gated on a positive /proc check so the
+            # chrome://inspect flow keeps owning every browser that *can* be
+            # debugged once the user flips the toggle.
+            restart_daemon(name)
+            _kill_unsuitable_browsers()
+            launched_browser = _launch_browser()
+            if launched_browser is None:
+                raise RuntimeError(
+                    "chrome-not-running: no supported browser is running and none could be launched -- ask the user to open Chrome, then retry."
+                )
+            print("browser-harness: no controllable browser found — launching one. If Chrome shows an \"Allow remote debugging?\" popup, click Allow.", file=sys.stderr)
+            from .daemon import supported_browser_running
+            boot_deadline = time.time() + 15
+            while time.time() < boot_deadline and not supported_browser_running():
+                time.sleep(0.3)
+            continue
+        if local and pending_died:
             continue
         if local and msg.startswith("handshake-wait"):
             # Leave it running: this daemon's connection is what holds the popup
@@ -664,20 +739,6 @@ def ensure_daemon(wait=None, name=None, env=None):
             raise RuntimeError(
                 "permission-blocked: Chrome did not approve the connection; browser-harness did not retry or create another connection."
             )
-        if local and launched_browser is None and _chrome_not_running(msg):
-            # Chrome is closed — launch the browser and retry
-            restart_daemon(name)
-            launched_browser = _launch_browser()
-            if launched_browser is None:
-                raise RuntimeError(
-                    "chrome-not-running: no supported browser is running and none could be launched -- ask the user to open Chrome, then retry."
-                )
-            print("browser-harness: Chrome isn't running — launching it. If Chrome shows an \"Allow remote debugging?\" popup, click Allow.", file=sys.stderr)
-            from .daemon import supported_browser_running
-            boot_deadline = time.time() + 15
-            while time.time() < boot_deadline and not supported_browser_running():
-                time.sleep(0.3)
-            continue
         if local and not opened_inspect and _needs_chrome_remote_debugging_prompt(msg):
             opened_inspect = True
             from .daemon import remote_debugging_toggle_profiles, remote_debugging_user_enabled
@@ -1271,8 +1332,220 @@ def _profile_directory_args(base):
     return [f"--profile-directory={last}"]
 
 
+def _browser_candidate_binaries():
+    """Absolute paths of every Chromium-family launcher we could invoke.
+
+    Used both to launch and to recognise a browser process by its executable,
+    so cleanup never has to guess from a command line.
+    """
+    import platform, shutil
+
+    if platform.system() in ("Darwin", "Windows"):
+        return []
+    names = list(_DEFAULT_LAUNCH[1])
+    explicit = []
+    for key in ("BH_CHROME_PATH", "CHROME_PATH"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            explicit.append(raw)
+    names = explicit + names
+    out = []
+    for name in names:
+        w = shutil.which(name) if not os.path.isabs(name) else (name if os.path.exists(name) else None)
+        if w and w not in out:
+            out.append(str(Path(w).resolve()))
+    return out
+
+
+def _normalize_browser_name(value):
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def _browser_main_pids():
+    """pid -> (exe, argv) for browser *main* processes we might need to replace.
+
+    ``/proc/PID/exe`` is what Chrome's launcher finally execs, so it is
+    ``<install dir>/chrome`` even when the user ran ``google-chrome-stable``;
+    matching therefore compares the executable's directory and name against the
+    launchers we know about. Only the browser process itself is returned:
+    renderers, GPU and utility children carry ``--type=`` and the
+    crashpad handler is not a browser, so killing the main process (and letting
+    its children follow) is both sufficient and safe.
+    """
+    import platform
+
+    if platform.system() in ("Darwin", "Windows"):
+        return {}
+    candidates = _browser_candidate_binaries()
+    if not candidates:
+        return {}
+    install_dirs = {str(Path(c).parent) for c in candidates}
+    main_names = {_normalize_browser_name(Path(c).name) for c in candidates}
+    # The real binary inside an install dir is usually just "chrome"/"chromium"
+    # regardless of which launcher name resolved to it.
+    main_names |= {"chrome", "chromium", "chromiumbrowser", "microsoftedge", "msedge", "brave", "headlessshell"}
+    me = os.getpid()
+    found = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            exe = str(Path(f"/proc/{pid}/exe").resolve(strict=False))
+        except OSError:
+            continue
+        if str(Path(exe).parent) not in install_dirs:
+            continue
+        if _normalize_browser_name(Path(exe).name) not in main_names:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = [a for a in fh.read().decode("utf-8", errors="replace").split("\0") if a]
+        except OSError:
+            continue
+        # Chrome rewrites its process title, so a child's whole command line can
+        # arrive as a single argv entry: search the joined text for --type=.
+        if "--type=" in " ".join(argv):
+            continue
+        found[pid] = (exe, argv)
+    return found
+
+
+def _chrome_supports_sandbox(binary):
+    """Can this Chrome build create user namespaces?
+
+    Unprivileged containers and sandboxes forbid ``CLONE_NEWUSER``, where the
+    zygote aborts before any window appears. The probe is cheap and only
+    decides whether to add ``--no-sandbox``, so a false negative merely costs
+    one flag rather than breaking the launch.
+    """
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [binary, "--headless=new", "--disable-gpu", "--dump-dom", "about:blank"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def _debug_port_of(cmdline):
+    """The --remote-debugging-port value in a browser cmdline, else None.
+
+    Reads the joined text rather than individual argv entries because Chrome
+    rewrites its process title and the flags can arrive as one string.
+    """
+    text = " ".join(cmdline)
+    match = re.search(r"(?:^|\s)--remote-debugging-port(?:=(?=\d)|\s+)(\d{1,5})(?=\s|$)", text)
+    if not match:
+        return None
+    try:
+        port = int(match.group(1))
+    except ValueError:
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _devtools_reachable(port, timeout=1.0):
+    """True when Chrome answers /json/version on this loopback port."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout) as r:
+            return bool(json.loads(r.read()).get("webSocketDebuggerUrl"))
+    except Exception:
+        return False
+
+
+def _kill_unsuitable_browsers(keep_pid=None):
+    """Stop browser instances the harness cannot drive, keep the usable ones.
+
+    A browser is suitable when it exposes a working CDP endpoint: its cmdline
+    carries ``--remote-debugging-port`` and that port answers
+    ``/json/version``. Anything else (a plain Chrome the user opened, a crashed
+    sandbox launch) would make discovery fail with chrome-not-running, so we
+    terminate it and let the caller relaunch a debuggable instance. SIGTERM
+    first so Chrome can release its SingletonLock and flush the profile, then
+    SIGKILL the survivors.
+    """
+    import signal
+
+    running = _browser_main_pids()
+    if not running:
+        return []
+    doomed, survivors = [], []
+    for pid, (exe, cmdline) in running.items():
+        if keep_pid is not None and pid == keep_pid:
+            continue
+        port = _debug_port_of(cmdline)
+        if port is not None and _devtools_reachable(port):
+            survivors.append(pid)
+            continue
+        doomed.append(pid)
+    if not doomed:
+        return survivors
+
+    for pid in doomed:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 5.0
+    alive = set(doomed)
+    while alive and time.time() < deadline:
+        time.sleep(0.2)
+        alive = {pid for pid in alive if _pid_alive(pid)}
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return survivors
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _auto_debug_url(profile):
+    """CDP HTTP endpoint for a browser we launched ourselves, else None.
+
+    Only the dedicated automation profile is launched with an explicit
+    ``--remote-debugging-port``; pointing the daemon at that port directly
+    skips the DevToolsActivePort/chrome://inspect discovery that recent Chrome
+    builds refuse to satisfy unattended.
+    """
+    if profile is None:
+        return None
+    try:
+        if Path(profile).resolve() != paths.automation_profile_dir().resolve():
+            return None
+    except OSError:
+        return None
+    return f"http://127.0.0.1:{paths.auto_debug_port()}"
+
+
 def _launch_browser():
-    """Prefers the browser whose profile already has perm box checked.
+    """Bring up a browser the harness can actually attach to.
+
+    Prefers the browser whose profile already has the chrome://inspect
+    permission box checked. On POSIX we launch a *dedicated* automation profile
+    with ``--remote-debugging-port`` explicitly: recent Chrome refuses the debug
+    port on a user's default profile and the inspect toggle needs a manual
+    approval popup, neither of which can be cleared unattended.
 
     Returns ``(process, profile)`` on success. ``process`` is available only
     when we launched the browser directly; ``profile`` is the user-data dir we
@@ -1282,11 +1555,17 @@ def _launch_browser():
     import platform, shutil, subprocess
     from .daemon import PROFILES, remote_debugging_toggle_profiles
 
+    system = platform.system()
+    if system not in ("Darwin", "Windows"):
+        # Unattended path: dedicated profile + explicit debug port, so no
+        # chrome://inspect toggle and no Allow popup are involved. Honors
+        # BH_CHROME_PATH/CHROME_PATH inside.
+        return _launch_debuggable_browser()
+
     enabled = remote_debugging_toggle_profiles()
     known_profiles = enabled + [
         base for base in PROFILES if base not in enabled and (base / "Local State").exists()
     ]
-    system = platform.system()
     for key in ("BH_CHROME_PATH", "CHROME_PATH"):
         raw = (os.environ.get(key) or "").strip()
         if raw and Path(raw).expanduser().is_file():
@@ -1336,6 +1615,60 @@ def _launch_browser():
         return None
 
 
+def _launch_debuggable_browser():
+    """POSIX: launch Chrome on a dedicated profile with CDP enabled.
+
+    Honors ``BH_CHROME_PATH``/``CHROME_PATH``: an explicit binary takes
+    precedence over the default launch names. Returns ``(process, profile)``
+    or None when no browser binary is usable.
+    """
+    import subprocess
+
+    candidates = _browser_candidate_binaries()
+    if not candidates:
+        return None
+    binary = candidates[0]
+
+    port = paths.auto_debug_port()
+    profile = paths.automation_profile_dir()
+    args = [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if not _chrome_supports_sandbox(binary):
+        # Unprivileged container: the zygote cannot clone a user namespace, so
+        # Chrome aborts unless the sandbox is off.
+        args += ["--no-sandbox", "--disable-dev-shm-usage"]
+    try:
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **ipc.spawn_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return process, profile
+
+
+def _browser_is_controllable(profile):
+    """Did the browser we launched for ``profile`` come up CDP-reachable?
+
+    Chrome 154 does not reliably write ``DevToolsActivePort``, so the port we
+    chose at launch time is the authoritative check; the file-based check stays
+    as a fallback for profiles we did not pick the port for.
+    """
+    from .daemon import _devtools_port_live
+
+    url = _auto_debug_url(profile)
+    if url is not None:
+        return _devtools_reachable(paths.auto_debug_port())
+    return _devtools_port_live(profile)
+
+
 def _cleanup_unattached_browser_launch(launch):
     """Stop a browser we launched when the daemon attached somewhere else."""
     if not launch:
@@ -1344,9 +1677,9 @@ def _cleanup_unattached_browser_launch(launch):
     if process is None or profile is None or process.poll() is not None:
         return
 
-    from .daemon import _devtools_port_live
-
-    if _devtools_port_live(profile):
+    if _browser_is_controllable(profile):
+        # This is the instance the daemon was pointed at (we inject
+        # BU_CDP_URL for it), or it is otherwise live and reachable — keep it.
         return
 
     import signal

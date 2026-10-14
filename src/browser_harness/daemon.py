@@ -110,6 +110,14 @@ def profile_dirs(system=None):
 
 
 PROFILES = profile_dirs()
+# The dedicated user-data dir that admin._launch_browser() auto-launches into is
+# scanned too: it is where a harness-owned browser actually lives, so liveness
+# checks and DevToolsActivePort discovery can see it. Appended last so the
+# user's own profiles keep priority when several of them are running.
+try:
+    PROFILES.append(paths.automation_profile_dir())
+except Exception:
+    pass
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
@@ -328,7 +336,16 @@ def get_ws_url():
         if now > deadline - 30 + grace:
             break
         time.sleep(0.2)
-    for probe_port in (9222, 9223):
+    # Ports we probe when no DevToolsActivePort was found. The auto-launch port
+    # comes first: Chrome 154 does not always write DevToolsActivePort, and a
+    # browser that the harness launched itself is the most likely candidate.
+    probe_ports = []
+    try:
+        probe_ports.append(paths.auto_debug_port())
+    except Exception:
+        pass
+    probe_ports += [9222, 9223]
+    for probe_port in dict.fromkeys(probe_ports):
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{probe_port}/json/version", timeout=1) as r:
                 return json.loads(r.read())["webSocketDebuggerUrl"]
